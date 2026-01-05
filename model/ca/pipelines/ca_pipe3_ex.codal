@@ -1,0 +1,347 @@
+/**
+ * Codasip s.r.o.
+ *
+ * CONFIDENTIAL
+ *
+ * Copyright 2022 Codasip s.r.o.
+ *
+ * All Rights Reserved.
+ *
+ * NOTICE: All information contained in this file, is and shall remain the property of
+ * Codasip s.r.o. and its suppliers, if any.
+ *
+ * The intellectual and technical concepts contained herein are confidential and proprietary to
+ * Codasip s.r.o. and are protected by trade secret and copyright law.  In addition, elements of the
+ * technical concepts may be patent pending.
+ *
+ * This file is part of the Codasip Studio product. No part of the Studio product, including this
+ * file, may be use, copied, modified, or distributed except in accordance with the terms contained
+ * in Codasip license agreement under which you obtained this file.
+ *
+ *  \file   ca_pipe3_ex.codal
+ *  \author Codasip
+ *  \date   09.02.2022
+ *  \brief  Execute stage - cycle accurate model
+ */
+
+#include "ca_defines.hcodal"
+#include "debug.hcodal"
+
+// -------------------------------------------------------------------------------------------------
+// Execute Stage
+// -------------------------------------------------------------------------------------------------
+event ex : pipeline(pipe.EX)
+{
+    // Phase 8
+    use ex_memory;
+    use ex_output;
+    semantics
+    {   
+         // Phase 6
+         
+        // FWDA control
+        if ((r_me_rd == r_ex_rs1) && (r_me_rd != 0) && (r_me_regwrite)){
+            s_ex_fwdA_sel = FWDA_ME_RD;
+        }else if ((r_wb_rd == r_ex_rs1) && (r_wb_rd != 0) && (r_wb_regwrite)){
+            s_ex_fwdA_sel = FWDA_WB_RD;
+        }else{
+            s_ex_fwdA_sel = FWDA_src1;
+        } 
+
+        // FWDB control
+        if ((r_me_rd == r_ex_rs2) && (r_me_rd != 0) && (r_me_regwrite)){ 
+            s_ex_fwdB_sel = FWDB_ME_RD;
+        }else if ((r_wb_rd == r_ex_rs2) && (r_wb_rd != 0) && (r_wb_regwrite)){
+            s_ex_fwdB_sel = FWDB_WB_RD;
+        }else{ 
+            s_ex_fwdB_sel = FWDB_src2;
+        }
+        
+        // Forward Switch MUXes (Note: Use ALU registers to get the right values)
+        switch (s_ex_fwdA_sel)
+        {
+            case FWDA_src1:
+                s_ex_fwdA = r_ex_reg1;
+                break;
+            case FWDA_WB_RD:
+                s_ex_fwdA = s_wb_result;
+                break;
+            case FWDA_ME_RD:
+                s_ex_fwdA = r_me_alu;
+                break;
+            default:
+                s_ex_fwdA = 0;
+                codasip_fatal(SRC2_ERROR, "Default case: %d\n", s_ex_fwdA);
+                break;
+        }
+
+        switch (s_ex_fwdB_sel)
+        {
+            case FWDB_src2:
+                s_ex_fwdB = r_ex_reg2;
+                break;
+            case FWDB_WB_RD:
+                s_ex_fwdB = s_wb_result;
+                break;
+            case FWDB_ME_RD:
+                s_ex_fwdB = r_me_alu;
+                break;
+            default:
+                s_ex_fwdB = 0;
+                codasip_fatal(SRC2_ERROR, "Default case: %d\n", s_ex_fwdB);
+                break;
+        }
+
+        // Phase 7: ALUSRC1
+        switch (r_ex_alusrc1)
+        {
+            case ALU_SRC1_REG:
+                s_ex_src1 = s_ex_fwdA;
+                break;
+            case ALU_SRC1_ZERO:
+                s_ex_src1 = 0;
+                break;
+            case ALU_SRC1_PC:
+                s_ex_src1 = r_ex_pc;
+                break;
+            default:
+                s_ex_src1 = 0;
+                codasip_fatal(SRC2_ERROR, "Default case: %d\n", s_ex_src1);
+                break;
+        }
+        // ALUsrc2 MUX between Immediate and Register
+        switch (r_ex_alusrc2)
+        {
+            case ALU2_REG:
+                // Phase 6: Updated to fwdB
+                s_ex_src2 = s_ex_fwdB;
+                break;
+            case ALU2_IMM:
+                s_ex_src2 = r_ex_immed;
+                break;
+            default:
+                s_ex_src2 = 0;
+                codasip_fatal(SRC2_ERROR, "Default case: %d\n", r_ex_alusrc2);
+                break;
+        }
+
+        // Phase 9: Fast Branches
+        s_ex_brnch_zero = s_ex_src1 ^ s_ex_src2;
+        switch (r_ex_brnchop) {
+            case BRANCH_FALSE:
+                s_ex_take_branch = 0;
+                break;
+            case BRANCH_TRUE:
+                // JALR
+                s_ex_take_branch = 1;
+                break;
+            case BRANCH_COND_TRUE:
+                s_ex_take_branch = 0;
+                break;
+            case BRANCH_COND_FALSE:
+                s_ex_take_branch = 0;
+                break;
+            // Phase 9: Add More Cases
+            case BRANCH_BEQ:
+                s_ex_take_branch = !(s_ex_brnch_zero); // Not since if equal XOR = 0
+                break;
+            case BRANCH_BNE:
+                if(s_ex_brnch_zero != 0){
+                    s_ex_take_branch = 1; // s_ex_brnch_zero != 0 if not equal
+                }else{
+                    s_ex_take_branch = 0;
+                }
+                break;
+            case BRANCH_JAL:
+                s_ex_take_branch = 0;
+                break;
+            default:
+                s_ex_take_branch = 0;
+                codasip_fatal(BRANCH_ERROR, "Default case: %d\n", s_ex_take_branch);
+                break;
+        }
+        // ALU Operation
+        switch (r_ex_aluop)
+        {
+            // Nop
+            case ALU_NOP:
+                s_ex_alu = 0;
+                break;
+            // Add
+            case ALU_ADD:
+                // Phase 6: Updated src1 to fwdA
+                // Phase 7: Updated to s_ex_src1
+                s_ex_alu = s_ex_src1 + s_ex_src2;
+                break;
+            // Phase 7: Added additional Ops
+            // And
+            case ALU_AND:
+                s_ex_alu = s_ex_src1 & s_ex_src2;
+                break;
+            // Sub
+            case ALU_SUB:
+                s_ex_alu = s_ex_src1 - s_ex_src2;
+                break;
+            // Or
+            case ALU_OR:
+                s_ex_alu = s_ex_src1 | s_ex_src2;
+                break;
+            // Xor
+            case ALU_XOR:
+                s_ex_alu = s_ex_src1 ^ s_ex_src2;
+                break;
+            // Set if Less Than
+            case ALU_SLT:
+                if (((int32) s_ex_src1) < ((int32) s_ex_src2)) s_ex_alu = 1;
+                else s_ex_alu = 0;
+                break;
+            // Set if Less Than Unsigned
+            case ALU_SLTU:
+                if (s_ex_src1 < s_ex_src2){
+                    s_ex_alu = 1;
+                }else{
+                    s_ex_alu = 0;
+                }
+                break;
+            // Shift Left Logical
+            case ALU_SLL:
+                s_ex_alu = s_ex_src1 << s_ex_src2;
+                break;
+            // Shift Right Logical
+            case ALU_SRL:
+                s_ex_alu = s_ex_src1 >> (int5) s_ex_src2;
+                break;
+            // Shift Right Arithmetic
+            case ALU_SRA:
+                s_ex_alu = (int32) s_ex_src1 >> (int5) s_ex_src2;
+                break;
+            default:
+                s_ex_alu = 0;
+                codasip_fatal(ALU_ERROR, "Default case: %d\n", r_ex_aluop);
+                break;
+        }
+
+        // Phase 8
+        ex_memory();
+
+        // Phase 7: Branch Target Address Calculation
+        switch (r_ex_brnch_sel)
+        {
+            case BRADD_ADDR:
+                s_ex_brimm = r_ex_pc + r_ex_immed;
+                s_ex_target_address = s_ex_brimm;
+                break;
+            case BRADD_ALU:
+                s_ex_target_address = s_ex_alu;
+                break;
+            default:
+                s_ex_target_address = 0;
+                codasip_fatal(ADDR_ERROR, "Default case: %d\n", s_ex_target_address);
+                break;
+        }
+
+        // Phase 7: Add Zero Output signal from ALU
+        if(s_ex_alu == 0) s_ex_zero = 1;
+        else s_ex_zero = 0;
+
+        // HALT instruction detection
+        if (r_ex_halt == HALT_HALT)
+        {
+            codasip_break();
+            codasip_info(INFO_GENERAL, "Halt Instructions Indicated");
+        }
+
+        
+        // Timing
+        ex_output();
+    };
+};
+
+// Phase 8:
+event ex_memory : pipeline(pipe.EX)
+{
+    semantics
+    {
+        uint1 op_rw; // Read/Write
+        uint2 op_type; //non-sequential/burst/idle
+        switch(r_ex_memop)
+        {
+            case MEM_NOP:
+                op_rw = DONT_CARE;
+                op_type = CP_AHB_IDLE;
+                s_ex_memsize = DONT_CARE;
+                break;
+            case MEM_LB:
+                op_rw = CP_AHB_READ;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_8;
+                break;
+            case MEM_LBU:
+                op_rw = CP_AHB_READ;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_8;
+                break;
+            case MEM_LH:
+                op_rw = CP_AHB_READ;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_16;
+                break;
+            case MEM_LHU:
+                op_rw = CP_AHB_READ;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_16;
+                break;
+            case MEM_LW:
+                op_rw = CP_AHB_READ;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_32;
+                break;
+            case MEM_SB:
+                op_rw = CP_AHB_WRITE;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_8;
+                break;
+            case MEM_SH:
+                op_rw = CP_AHB_WRITE;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_16;
+                break;
+            case MEM_SW:
+                op_rw = CP_AHB_WRITE;
+                op_type = CP_AHB_NONSEQ;
+                s_ex_memsize = CP_AHB_SIZE_32;
+                break;
+            default:
+                op_rw = DONT_CARE;
+                op_type = CP_AHB_IDLE;
+                s_ex_memsize = DONT_CARE;
+                codasip_fatal(MEMOP_ERROR, "Default case: %d\n", s_ex_memsize);
+                break;
+        }
+        ldst.transport(CP_PHS_ADDRESS, op_type, op_rw, s_ex_alu, s_ex_memsize);
+        s_ex_encoded_data = ldst.encode_data(s_ex_fwdB, s_ex_alu, s_ex_memsize);
+        // Check here
+        s_ex_stall = s_me_stall;
+    };
+};
+
+event ex_output : pipeline(pipe.EX)
+{
+    semantics
+    {
+        r_me_pc = r_ex_pc;
+        r_me_alu = s_ex_alu;
+        r_me_regwrite = r_ex_regwrite;
+        r_me_rd = r_ex_rd;
+        r_me_instr = r_ex_instr;
+        // Phase 7: Add More Pipeline control signals
+        r_me_brnchop = r_ex_brnchop;
+        r_me_rfwt_sel = r_ex_rfwt_sel;
+        r_me_target_addr = s_ex_target_address;
+        r_me_zero = s_ex_zero;
+        // Phase 8: Add more pipelines
+        r_me_memsize = s_ex_memsize;
+        r_me_wtdat = s_ex_encoded_data;
+        r_me_memop = r_ex_memop;
+    };
+};

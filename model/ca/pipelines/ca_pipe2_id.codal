@@ -1,0 +1,210 @@
+/**
+ * Codasip s.r.o.
+ *
+ * CONFIDENTIAL
+ *
+ * Copyright 2022 Codasip s.r.o.
+ *
+ * All Rights Reserved.
+ *
+ * NOTICE: All information contained in this file, is and shall remain the property of
+ * Codasip s.r.o. and its suppliers, if any.
+ *
+ * The intellectual and technical concepts contained herein are confidential and proprietary to
+ * Codasip s.r.o. and are protected by trade secret and copyright law.  In addition, elements of the
+ * technical concepts may be patent pending.
+ *
+ * This file is part of the Codasip Studio product. No part of the Studio product, including this
+ * file, may be use, copied, modified, or distributed except in accordance with the terms contained
+ * in Codasip license agreement under which you obtained this file.
+ *
+ *  \file   ca_pipe2_ex.codal
+ *  \author Codasip
+ *  \date   09.02.2022
+ *  \brief  cycle accurate model
+ */
+
+#include "config.hcodal"
+#include "ca_defines.hcodal"
+
+// -------------------------------------------------------------------------------------------------
+// Decode stage
+// -------------------------------------------------------------------------------------------------
+
+event id : pipeline(pipe.ID)
+{
+    use dec;
+    use id_output;
+
+    semantics
+    {
+        // Read Instruction Memory
+        uint32 id_instr_temp;
+        bool cache_ready, cache_response;
+        if_code.transport(CP_PHS_DATA, cache_ready, cache_response, id_instr_temp);
+        // Phase 8: Update s_id_instr assignment
+        if (r_id_clear){
+            s_id_instr = NOP_INSTRUCTION;
+        } else if (r_id_stall){
+            s_id_instr = r_id_instr_preserved;
+            r_id_pc = r_id_pc_preserved;
+        } else {
+            s_id_instr = id_instr_temp;
+        }
+        // This is used because of the first cycle being 0 and not the instruction, so we put a NOP to prevent an error when r_id_clear is 1
+        //s_id_instr = r_id_clear ? NOP_INSTRUCTION : id_instr_temp;
+
+        // Decoding the Instruction:
+
+        // Opcode
+        s_id_opc = s_id_instr[31..25] :: s_id_instr[14..12] :: s_id_instr[6..0];
+
+        // First source register
+        s_id_rs1 = s_id_instr[19..15];
+
+        // Second source register
+        s_id_rs2 = s_id_instr[24..20];
+
+        // Destination register
+        s_id_rd = s_id_instr[11..7];
+
+        // Immediate decode, Takes bits 31:20, makes it into 12 bit signed int, then sign extends to 32 bits
+        s_id_immedi = (int32) (int12) s_id_instr[31..20]; // I-type immediate
+        // Phase 7: New Immediates
+        // B-Type
+        s_id_immedb = ((int32) (int12) (s_id_instr[31..31] :: s_id_instr[7..7] :: s_id_instr[30..25] :: s_id_instr[11..8])) << 1;
+        // S-Type
+        s_id_immeds = (int32) (int12) (s_id_instr[31..25] :: s_id_instr[11..7]);
+        // U-Type
+        s_id_immedu = ((int32) (int20) s_id_instr[31..12]) << 12; // U-type immediate
+        // J-Type
+        s_id_immedj = ((int32) (int20) (s_id_instr[31..31] :: s_id_instr[19..12] :: s_id_instr[20..20] :: s_id_instr[30..21])) << 1; // J-type immediate
+
+        // Read the Values (RegFileRead)
+        s_id_reg1 = rf_xpr.src1[s_id_rs1];
+        s_id_reg2 = rf_xpr.src2[s_id_rs2];
+
+        // Phase 8: Update when loadhaz is set, include 0 case because you can't read from x0
+        if(((s_id_rs1 == r_ex_rd) || (s_id_rs2 == r_ex_rd)) && ((r_ex_memop == MEM_LB) ||
+        (r_ex_memop == MEM_LBU) || (r_ex_memop == MEM_LH) || (r_ex_memop == MEM_LHU) || (r_ex_memop == MEM_LW)) && (r_ex_rd != 0)){
+            s_id_loadhaz = 1;
+        }else{
+            s_id_loadhaz = 0;
+        }
+        // Phase 8: Updated to be s_ex_stall | s_id_loadhaz
+        // Set local stall.
+        s_id_stall = (s_ex_stall || s_id_loadhaz);
+
+        // Phase 6
+        // RFF1 control
+        if ((r_wb_rd == s_id_rs1) && (r_wb_rd != 0) && (r_wb_regwrite)){ 
+            s_rff1_sel = RFF1_WB_RD;
+        }else{ 
+            s_rff1_sel = RFF1_RS1;
+        }
+        // RFF2 control
+        if ((r_wb_rd == s_id_rs2) && (r_wb_rd != 0) && (r_wb_regwrite)){ 
+            s_rff2_sel = RFF2_WB_RD;
+        }else{ 
+            s_rff2_sel = RFF2_RS2;
+        }
+        // Switch Statements (MUXes)
+        switch (s_rff1_sel)
+        {
+            case RFF1_WB_RD:
+                s_id_rff1 = s_wb_result;
+                break;
+            case RFF1_RS1:
+                s_id_rff1 = s_id_reg1;
+                break;
+            default:
+                s_id_rff1 = 0;
+                codasip_fatal(SRC2_ERROR, "Default case: %d\n", s_id_rff1);
+                break;
+        }
+
+        switch (s_rff2_sel)
+        {
+            case RFF2_WB_RD:
+                s_id_rff2 = s_wb_result;
+                break;
+            case RFF2_RS2:
+                s_id_rff2 = s_id_reg2;
+                break;
+            default:
+                s_id_rff2 = 0;
+                codasip_fatal(SRC2_ERROR, "Default case: %d\n", s_id_rff2);
+                break;
+        }
+        // Decoder activation
+        dec(s_id_opc);
+
+        // Phase 7: IMMGEN
+        switch(s_id_immsel){
+            case IMM_NONE:
+                s_id_immed = 0;
+                break;
+            case IMM_ITYPE:
+                s_id_immed = s_id_immedi; 
+                break;
+            case IMM_STYPE:
+                s_id_immed = s_id_immeds; 
+                break;
+            case IMM_BTYPE:
+                s_id_immed = s_id_immedb; 
+                break;
+            case IMM_UTYPE:
+                s_id_immed = s_id_immedu; 
+                break;
+            case IMM_JTYPE:
+                s_id_immed = s_id_immedj; 
+                break;
+            default:
+                s_id_immed = 0;
+                codasip_fatal(IMM_ERROR, "Default case: %d\n", s_id_immed);
+                break;
+        }
+        // Phase 9: Fast JAL: Need Adder for Address calculation, and set take branch signal
+        if(s_id_brnchop == BRANCH_JAL){
+            s_id_jalpc = r_id_pc + s_id_immed;
+            s_id_take_jump = 1;
+        }
+        // Update the registers
+        id_output();
+    };
+};
+event id_output : pipeline(pipe.ID)
+{
+
+    semantics
+    {
+        // -----------------------------------------------------------------------------------------
+        // Pipeline output
+        // -----------------------------------------------------------------------------------------
+        r_ex_pc = r_id_pc;
+        r_ex_aluop = s_id_aluop;
+        r_ex_regwrite = s_id_regwrite;
+        r_ex_alusrc2 = s_id_alusrc2;
+        r_ex_halt = s_id_halt;
+        r_ex_rd = s_id_rd;
+        // Phase 6: Changed rs1 and rs2 to rff1 and rff2
+        r_ex_reg1 = s_id_rff1;
+        r_ex_reg2 = s_id_rff2;
+        //Phase 6: Added rs1 and rs2 pipelined, Note Rs1 and Rs2 = src1 and src2
+        r_ex_rs1 = s_id_rs1;
+        r_ex_rs2 = s_id_rs2;
+        r_ex_immed = s_id_immed;
+        r_ex_instr = s_id_instr; 
+        
+        // Phase 7: Add New Control Signals
+        r_ex_brnchop = s_id_brnchop;
+        r_ex_rfwt_sel = s_id_rfwt_sel;
+        r_ex_brnch_sel = s_id_brnch_sel;
+        r_ex_alusrc1 = s_id_alusrc1;
+
+        // Phase 8: Update instr. Preserved and pipeline s_id_memop
+        r_ex_memop = s_id_memop;
+        r_id_instr_preserved = s_id_instr;
+        r_id_pc_preserved = r_id_pc;
+    };
+};
